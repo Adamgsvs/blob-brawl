@@ -1,0 +1,17 @@
+{
+  "name": "blob-brawl",
+  "version": "1.0.0",
+  "description": "Online party-brawler with wobbly ragdoll blobs (PC + mobile)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test-sim.js"
+  },
+  "dependencies": {
+    "three": "^0.170.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#2b1d5c">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Blob Brawl — فوضى الوحوش</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Baloo+Bhaijaan+2:wght@500;700;800&family=Lilita+One&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="vignette"></div>
+
+<!-- ================= MENU ================= -->
+<section id="menu" class="screen">
+  <div class="bgblobs"><i></i><i></i><i></i><i></i><i></i></div>
+  <div class="menu-wrap">
+    <header>
+      <h1 class="logo"><span>BLOB</span> <span>BRAWL</span></h1>
+      <p class="sub" data-i="subtitle"></p>
+    </header>
+    <div class="menu-grid">
+      <div class="card char-card">
+        <canvas id="preview" width="300" height="340"></canvas>
+        <div id="custTabs" class="tabs"></div>
+        <div id="custOpts" class="custopts"></div>
+        <button id="rand" class="mini"></button>
+      </div>
+      <div class="card play-card">
+        <label class="lbl" data-i="yourName"></label>
+        <input id="name" maxlength="14" autocomplete="off" spellcheck="false">
+        <button id="btnQuick" class="big green" data-i="quick"></button>
+        <div class="row">
+          <button id="btnCreate" class="big blue" data-i="create"></button>
+          <button id="btnPractice" class="big orange" data-i="practice"></button>
+        </div>
+        <label class="chk"><input type="checkbox" id="pubChk"> <span data-i="publicRoom"></span></label>
+        <div class="row joinrow">
+          <input id="code" maxlength="4" placeholder="ABCD" autocomplete="off" spellcheck="false">
+          <button id="btnJoin" class="big pink" data-i="join"></button>
+        </div>
+        <p id="menuMsg" class="msg"></p>
+        <div class="row small-row">
+          <button id="btnSettings" class="mini wide">⚙️ <span data-i="settings"></span></button>
+          <button id="btnHelp" class="mini wide">🎮 <span data-i="controls"></span></button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= LOBBY ================= -->
+<section id="lobby" class="screen hidden">
+  <div class="bgblobs"><i></i><i></i><i></i><i></i><i></i></div>
+  <div class="lobby-wrap">
+    <div class="lobby-top">
+      <button id="btnLeave" class="mini">⬅ <span data-i="leave"></span></button>
+      <div class="roomcode">
+        <small data-i="roomCode"></small>
+        <b id="roomCode">----</b>
+        <button id="btnCopy" class="mini">🔗 <span data-i="copyLink"></span></button>
+      </div>
+      <button id="btnSettings2" class="mini">⚙️</button>
+    </div>
+    <div class="lobby-grid">
+      <div class="card players-card">
+        <h3 data-i="players"></h3>
+        <div id="players" class="players"></div>
+        <div class="chat">
+          <div id="chatLog"></div>
+          <div class="row"><input id="chatIn" maxlength="100" data-iph="chatPh" autocomplete="off"><button id="chatSend" class="mini">➤</button></div>
+        </div>
+      </div>
+      <div class="card opts-card">
+        <h3 data-i="map"></h3>
+        <div id="mapGrid" class="mapgrid"></div>
+        <div class="optrow"><span data-i="mode"></span>
+          <div class="seg" id="modeSeg"><button data-mode="ffa" data-i="ffa"></button><button data-mode="teams" data-i="teams"></button></div></div>
+        <div class="optrow"><span data-i="winsNeeded"></span>
+          <div class="seg" id="winsSeg"><button data-wins="1">1</button><button data-wins="3">3</button><button data-wins="5">5</button><button data-wins="7">7</button></div></div>
+        <div class="optrow"><span data-i="bots"></span>
+          <div class="stepper"><button id="botMinus">−</button><b id="botCount">0</b><button id="botPlus">+</button></div></div>
+        <div class="row lobby-actions">
+          <button id="btnTeam" class="big blue hidden" data-i="switchTeam"></button>
+          <button id="btnReady" class="big yellow" data-i="ready"></button>
+          <button id="btnStart" class="big green" data-i="start"></button>
+        </div>
+        <p id="lobbyMsg" class="msg"></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= HUD ================= -->
+<div id="hud" class="hidden">
+  <div id="score"></div>
+  <button id="btnMenu" class="hudbtn">☰</button>
+  <div id="ping">--</div>
+  <div id="banner"></div>
+  <div id="big"></div>
+  <div id="spectate" class="hidden" data-i="spectating"></div>
+  <div id="emotebar"></div>
+  <div id="rotate" data-i="rotate"></div>
+</div>
+
+<!-- ================= TOUCH CONTROLS ================= -->
+<div id="touch" class="hidden">
+  <div id="stick"><div id="knob"></div></div>
+  <div class="tbtn" id="tJump"><span>⬆</span><small data-i="bJump"></small></div>
+  <div class="tbtn" id="tPunch"><span>👊</span><small data-i="bPunch"></small></div>
+  <div class="tbtn" id="tGrab"><span>✋</span><small data-i="bGrab"></small></div>
+  <div class="tbtn small" id="tEmote"><span>😜</span></div>
+</div>
+
+<!-- ================= MODALS ================= -->
+<div id="modal" class="hidden">
+  <div class="modal-card" id="modalBody"></div>
+</div>
+<div id="toast"></div>
+
+<script type="importmap">{"imports":{"three":"/three.module.js"}}</script>
+<script src="maps.js"></script>
+<script src="audio.js"></script>
+<script src="input.js"></script>
+<script type="module" src="render3d.js"></script>
+<script type="module" src="main.js"></script>
+</body>
+</html>
