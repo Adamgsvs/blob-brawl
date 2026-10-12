@@ -3,6 +3,8 @@ import * as R from './render.js';
 import { STAGES, stageById } from '../shared/stages.js';
 import { PALETTE, COSTUMES, HEADS, FACES, PRESETS, DEFAULT_LOOK, cleanLook } from '../shared/looks.js';
 import { P } from '../shared/skeleton.js';
+import { parseSnap, Timeline } from './netstate.js';
+import { Predictor } from './predict.js';
 
 const $ = id => document.getElementById(id);
 const LS = {
@@ -63,7 +65,7 @@ function applyLang() {
 }
 
 // ============================================================================================ settings
-const S = { vol: LS.get('vol', 0.7), music: LS.get('music', true), quality: LS.get('quality', 'auto'), touch: LS.get('touch', 'auto'), cam: LS.get('cam', 'follow') };
+const S = { vol: LS.get('vol', 0.7), music: LS.get('music', true), quality: LS.get('quality', 'auto'), touch: LS.get('touch', 'auto'), cam: LS.get('cam', 'follow'), predict: LS.get('predict', true) };
 let autoQ = 1;
 const qLevel = () => (S.quality === 'auto' ? autoQ : S.quality === 'low' ? 0 : S.quality === 'mid' ? 1 : 2);
 const isTouch = () => (S.touch === 'on' ? true : S.touch === 'off' ? false : (window.matchMedia && matchMedia('(pointer:coarse)').matches) || 'ontouchstart' in window);
@@ -88,8 +90,8 @@ let sizeKey = '';
 
 // ============================================================================================ network
 let ws = null, meId = null, room = null, round = null, screen = 'menu', backTo = 'menu';
-let offset = null, pendingPractice = false, lastSent = 0, lastIn = '';
-const snaps = [], evq = [];
+let pendingPractice = false, lastSent = 0, lastIn = '', rtt = 120, pred = null;
+const TL = new Timeline(), evq = [], rtts = [];
 const send = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
 function setMsg(s) { $('menuMsg').textContent = s || ''; }
 function toast(s) { const e = $('toast'); e.textContent = s; e.classList.add('show'); clearTimeout(toast.t); toast.t = setTimeout(() => e.classList.remove('show'), 2600); }
@@ -107,7 +109,7 @@ function connect(cb) {
 }
 function onMsg(m) {
   switch (m.t) {
-    case 'joined': meId = m.id; Sfx.play('join'); if (pendingPractice) { pendingPractice = false; send({ t: 'set', bots: 3, mode: 'melee' }); send({ t: 'start' }); } break;
+    case 'joined': meId = m.id; Sfx.play('join'); rtts.length = 0; pingT = 0; if (pendingPractice) { pendingPractice = false; send({ t: 'set', bots: 3, mode: 'melee' }); send({ t: 'start' }); } break;
     case 'room': {
       const first = !room; room = m; room.byId = {}; m.members.forEach(x => { room.byId[x.id] = x; });
       if (m.phase === 'lobby') round = null;
@@ -126,12 +128,14 @@ function onMsg(m) {
     case 'toast': toast(t(m.k)); $('lobbyMsg').textContent = t(m.k); break;
     case 'err': setMsg(t(m.k)); toast(t(m.k)); break;
     case 'kicked': toast(t('kicked')); break;
-    case 'pong': $('ping').textContent = Math.round(performance.now() - m.c) + ' ms'; break;
+    case 'pong': { const v = performance.now() - m.c; rtts.push(v); if (rtts.length > 6) rtts.shift(); rtt = Math.min(...rtts); $('ping').textContent = Math.round(v) + ' ms'; break; }
   }
 }
-setInterval(() => { if (room) send({ t: 'ping', c: performance.now() }); }, 2000);
+// the round trip is measured often at first (the prediction needs it), then once a second
+let pingT = 0;
+setInterval(() => { if (!room) return; if (rtts.length < 6 || ++pingT % 4 === 0) send({ t: 'ping', c: performance.now() }); }, 250);
 function goMenu() {
-  room = null; round = null; meId = null; snaps.length = 0; evq.length = 0;
+  room = null; round = null; meId = null; TL.reset(true); pred = null; evq.length = 0;
   if (ws) { try { ws.close(); } catch (e) { } ws = null; }
   closeModal(); show('menu'); history.replaceState(null, '', location.pathname);
 }
@@ -296,11 +300,12 @@ $('btnEmote').onclick = () => eb.classList.toggle('show');
 
 // ============================================================================================ game
 let stage = null, curPh = -1, lastCd = -1, scoreSig = '', focusId = null, lastGT = 0, lastBrk = 0, keysT = 0, windT = 0;
-const INTERP = 100, pose = new Map();
+const pose = TL.pose;
 function startRound(m) {
-  round = m; stage = stageById(m.stage); snaps.length = 0; evq.length = 0; curPh = -1; lastCd = -1; scoreSig = ''; focusId = null; lastBrk = 0;
+  round = m; stage = stageById(m.stage); TL.reset(false); evq.length = 0;
+  pred = S.predict && m.ids.includes(meId) ? new Predictor(m.stage, meId, m.ids.map(id => ({ id, team: room.byId[id] ? room.byId[id].team : 0 }))) : null; curPh = -1; lastCd = -1; scoreSig = ''; focusId = null; lastBrk = 0;
   R.showStage(m.stage); sceneKey = m.stage;
-  pose.clear(); show('game'); closeModal(); resize();
+  show('game'); closeModal(); resize();
   for (const id of m.ids) R.poseBeast(id, tmp, { hide: true });
   banner(t('round') + ' ' + m.round + ' — ' + nm(stage.name), 2600);
   $('big').textContent = '';
@@ -310,39 +315,17 @@ function banner(s, ms) { const b = $('banner'); b.textContent = s; b.classList.r
 function big(s) { const b = $('big'); b.textContent = s; b.classList.remove('pop'); void b.offsetWidth; b.classList.add('pop'); }
 
 function onSnap(buf) {
-  const dv = new DataView(buf); if (dv.getUint8(0) !== 1 || !round) return;
-  const s = { ph: dv.getUint8(1), rid: dv.getUint16(2, true), ts: dv.getUint32(4, true), gt: dv.getFloat32(8, true), cd: dv.getUint8(12), brk: dv.getUint16(14, true), b: new Map() };
-  if (s.rid !== round.rid) return;
-  const n = dv.getUint8(13); let o = 16;
-  for (let i = 0; i < n; i++) {
-    const id = dv.getUint16(o, true), f = dv.getUint8(o + 2); o += 4; let Pp = null;
-    if (f & 1) { Pp = new Float32Array(42); for (let k = 0; k < 42; k++) Pp[k] = dv.getInt16(o + k * 2, true) / 100; o += 84; }
-    s.b.set(id, { f, P: Pp });
-  }
-  const now = performance.now(), sample = s.ts - now;
-  if (offset === null || sample > offset || Math.abs(sample - offset) > 2000) offset = sample; else offset += (sample - offset) * 0.02;
-  snaps.push(s); if (snaps.length > 40) snaps.shift();
+  if (!round) return;
+  const s = parseSnap(buf); if (!s || s.rid !== round.rid) return;
+  const now = performance.now();
+  TL.add(s, now);
+  if (pred) pred.onSnap(s, now, TL.offset, rtt);
 }
 
-// interpolated state of the world at render time rt
-function sample(rt) {
-  if (!snaps.length) return null;
-  let a = null, b = null;
-  for (let i = snaps.length - 1; i >= 0; i--) if (snaps[i].ts <= rt) { a = snaps[i]; b = snaps[i + 1] || null; break; }
-  if (!a) { a = snaps[0]; b = null; }
-  const k = b ? Math.min(1, (rt - a.ts) / Math.max(1, b.ts - a.ts)) : 0; if (!b) b = a;
-  while (snaps.length > 3 && snaps[1].ts < rt - 400) snaps.shift();
-  for (const [id, pb] of b.b) {
-    let o = pose.get(id); if (!o) { o = { P: new Float32Array(42), alive: false, ko: false }; pose.set(id, o); }
-    const pa = a.b.get(id);
-    o.alive = !!(pb.f & 1) && !!pb.P; o.ko = !!(pb.f & 2);
-    if (o.alive) { const A = pa && pa.P ? pa.P : pb.P, B = pb.P; for (let i = 0; i < 42; i++) o.P[i] = A[i] + (B[i] - A[i]) * k; }
-  }
-  return { gt: a.gt + (b.gt - a.gt) * k, ph: b.ph, cd: b.cd, brk: b.brk };
-}
-
+const OWN = { jump: 1, land: 1, step: 1, swing: 1 };        // our own, heard from the prediction instead of a round trip later
 function onEvent(e) {
   const q = qLevel(), FX = R.FX;
+  if (!e.local && e.i === meId && OWN[e.e] && pred && pred.active) return;
   switch (e.e) {
     case 'swing': Sfx.play('swing'); break;
     case 'hit': FX.impact(e.x, e.y, e.z, e.p); Sfx.play('hit', e.p); break;
@@ -402,8 +385,9 @@ function gameFrame(dt, now) {
   // input
   const inp = Input.poll(), key = inp.x + ',' + inp.z + ',' + inp.b;
   if (key !== lastIn || now - lastSent > 150) { lastIn = key; lastSent = now; send({ t: 'in', x: inp.x, z: inp.z, b: inp.b }); }
-  const rt = now + (offset || 0) - INTERP, fr = sample(rt);
+  const rt = TL.time(now, dt), fr = TL.sample(rt);
   while (evq.length && evq[0].ts <= rt) { for (const e of evq.shift().l) onEvent(e); }
+  if (pred && fr) { pred.frame(now, dt, inp, pose, TL.offset, rtt); for (const e of pred.takeEvents()) { e.local = true; onEvent(e); } }
   let view = { mode: 'group', box: null }, meAlive = false, mePose = null, n = 0;
   box6[0] = box6[2] = box6[4] = 1e9; box6[1] = box6[3] = box6[5] = -1e9;
   if (fr) {
@@ -464,6 +448,6 @@ window.addEventListener('pointerdown', () => Sfx.init(), { once: true });
 window.addEventListener('keydown', () => Sfx.init(), { once: true });
 applyLang(); show('menu'); resize();
 requestAnimationFrame(loop);
-window.__bb = { R, send, get room() { return room; }, get round() { return round; }, get pose() { return pose; }, get screen() { return screen; }, step: (n) => { for (let i = 0; i < (n || 1); i++) frame(performance.now()); } };
+window.__bb = { R, send, get room() { return room; }, get round() { return round; }, get pose() { return pose; }, get pred() { return pred; }, get net() { return { rtt, delay: TL.delay, gap: TL.gap, late: TL.late, dev: TL.dev }; }, get screen() { return screen; }, step: (n) => { for (let i = 0; i < (n || 1); i++) frame(performance.now()); } };
 const urlRoom = new URLSearchParams(location.search).get('room');
 if (urlRoom) { $('code').value = urlRoom.toUpperCase().slice(0, 4); setTimeout(() => enter({ t: 'join', code: urlRoom.toUpperCase().slice(0, 4) }), 300); }

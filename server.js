@@ -168,7 +168,7 @@ class Room {
 
     const ev = g.takeEvents();
     if (ev.length) this.broadcast({ t: 'ev', ts: now(), l: ev });
-    if (this.steps % 2 === 0) {                                                 // snapshots at 30 Hz
+    {                                                                         // a snapshot every tick (60 Hz)
       const ph = this.phase === 'countdown' ? 0 : this.phase === 'playing' ? 1 : this.phase === 'roundEnd' ? 2 : 3;
       const buf = g.snapshot(this.rid, ph, this.phase === 'countdown' ? Math.ceil(this.timer * DT) : 0, now());
       for (const m of this.members) {
