@@ -1,31 +1,33 @@
-'use strict';
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const { WebSocketServer } = require('ws');
-const Maps = require('./public/maps.js');
-const { Game, DT } = require('./sim.js');
+// HTTP (static files) + WebSocket (rooms, lobby, matches). The server owns the physics.
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer } from 'ws';
+import { Game, DT } from './src/sim.js';
+import { botThink } from './src/bots.js';
+import { STAGES } from './public/shared/stages.js';
+import { cleanLook, randomLook } from './public/shared/looks.js';
 
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const PUB = path.join(ROOT, 'public');
 const PORT = +process.env.PORT || 3000;
-const PUB = path.join(__dirname, 'public');
-const MAX_MEMBERS = 8;
-const MIME = {
-  '.html': 'text/html; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.webmanifest': 'application/manifest+json'
-};
+const MAX = 8;
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon' };
 
-// ---------------------------------------------------------------- http (static files)
+// ---------------------------------------------------------------- static files
 const server = http.createServer((req, res) => {
   let url = decodeURIComponent((req.url || '/').split('?')[0]);
   if (url === '/') url = '/index.html';
   if (url === '/health') { res.writeHead(200); return res.end('ok'); }
-  let file = path.normalize(path.join(PUB, url));
-  if (url === '/three.module.js') file = path.join(__dirname, 'node_modules', 'three', 'build', 'three.module.js');
-  else if (!file.startsWith(PUB)) { res.writeHead(403); return res.end(); }
+  let file;
+  if (url.startsWith('/three/')) file = path.normalize(path.join(ROOT, 'node_modules', 'three', url.slice(7)));   // three.js straight from node_modules
+  else file = path.normalize(path.join(PUB, url));
+  if (!file.startsWith(PUB) && !file.startsWith(path.join(ROOT, 'node_modules', 'three'))) { res.writeHead(403); return res.end(); }
   fs.readFile(file, (err, data) => {
     if (err) { res.writeHead(404); return res.end('not found'); }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': url.startsWith('/three/') ? 'public, max-age=86400' : 'no-cache' });
     res.end(data);
   });
 });
@@ -37,63 +39,45 @@ let nextId = 1;
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const cleanName = s => String(s || '').replace(/[<>&"'`\\]/g, '').replace(/\s+/g, ' ').trim().slice(0, 14);
 const BOT_NAMES = ['بطّة', 'كعكة', 'زلبحة', 'فستقة', 'شاورما', 'بسبوسة', 'دبّوس', 'طنجرة', 'فلافل', 'ملوخية'];
-function cleanLook(l) {
-  l = l || {};
-  return { s: clamp(l.s | 0, 0, 9), c: clamp(l.c | 0, 0, 15), d: clamp(l.d | 0, 0, 15), o: clamp(l.o | 0, 0, 9), h: clamp(l.h | 0, 0, 11), f: clamp(l.f | 0, 0, 5) };
-}
+const send = (ws, o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
+const now = () => Math.round(performance.now());
 function newCode() {
   const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
-  for (;;) {
-    let c = ''; for (let i = 0; i < 4; i++) c += abc[(Math.random() * abc.length) | 0];
-    if (!rooms.has(c)) return c;
-  }
+  for (;;) { let c = ''; for (let i = 0; i < 4; i++) c += abc[(Math.random() * abc.length) | 0]; if (!rooms.has(c)) return c; }
 }
-const send = (ws, o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
 
 // ---------------------------------------------------------------- room
 class Room {
   constructor(code, pub) {
-    this.code = code; this.pub = pub;
-    this.members = []; // {id,name,look,ready,team,bot,wins,ws}
-    this.hostId = null;
-    this.settings = { map: 'random', mode: 'ffa', wins: 3, bots: 0 };
-    this.phase = 'lobby'; // lobby | countdown | playing | roundEnd | matchEnd
-    this.game = null; this.rid = 0; this.timer = 0; this.endTimer = 0; this.lastMap = null;
-    this.chat = []; this.roundMsg = null; this.steps = 0;
-    this.createdAt = Date.now();
+    this.code = code; this.pub = pub; this.members = []; this.hostId = null;
+    this.set = { stage: 'random', mode: 'melee', wins: 3, bots: 0 };
+    this.phase = 'lobby';                // lobby | countdown | playing | roundEnd | matchEnd
+    this.game = null; this.rid = 0; this.round = 0; this.timer = 0; this.endTimer = 0; this.ticks = 0; this.steps = 0;
+    this.lastStage = null; this.roundMsg = null;
   }
   get humans() { return this.members.filter(m => !m.bot); }
-
-  broadcast(o, except) {
-    const s = JSON.stringify(o);
-    for (const m of this.members) if (!m.bot && m.ws !== except && m.ws.readyState === 1) m.ws.send(s);
-  }
-  roomInfo() {
+  broadcast(o) { const s = JSON.stringify(o); for (const m of this.members) if (!m.bot && m.ws.readyState === 1) m.ws.send(s); }
+  info() {
     return {
-      t: 'room', code: this.code, host: this.hostId, phase: this.phase, pub: this.pub, settings: this.settings,
+      t: 'room', code: this.code, host: this.hostId, phase: this.phase, pub: this.pub, set: this.set,
       members: this.members.map(m => ({ id: m.id, name: m.name, look: m.look, ready: m.ready, team: m.team, bot: m.bot, wins: m.wins }))
     };
   }
-  sync() { this.broadcast(this.roomInfo()); }
+  sync() { this.broadcast(this.info()); }
 
   add(ws, name, look) {
     const m = { id: nextId++, name: cleanName(name) || 'لاعب', look: cleanLook(look), ready: false, team: 0, bot: false, wins: 0, ws };
-    this.members.push(m); ws.member = m; ws.room = this;
+    this.balance(m); this.members.push(m); ws.member = m; ws.room = this;
     if (this.hostId == null) this.hostId = m.id;
-    this.autoTeam(m);
     this.fixBots();
     send(ws, { t: 'joined', id: m.id, code: this.code });
     if (this.roundMsg && this.phase !== 'lobby') send(ws, this.roundMsg);
     this.sync();
-    return m;
   }
-  autoTeam(m) {
-    const c = [0, 0]; for (const x of this.members) if (x !== m) c[x.team]++;
-    m.team = c[0] <= c[1] ? 0 : 1;
-  }
+  balance(m) { const c = [0, 0]; for (const x of this.members) c[x.team]++; m.team = c[0] <= c[1] ? 0 : 1; }
   remove(m) {
     this.members = this.members.filter(x => x !== m);
-    if (this.game && this.game.byId.get(m.id)) { const p = this.game.byId.get(m.id); if (p.alive) this.game.die(p, 'leave'); }
+    const b = this.game && this.game.byId.get(m.id); if (b && b.alive) this.game.die(b, 'left');
     if (!this.humans.length) { rooms.delete(this.code); return; }
     if (this.hostId === m.id) this.hostId = this.humans[0].id;
     this.fixBots();
@@ -101,55 +85,39 @@ class Room {
     this.sync();
   }
   fixBots() {
-    // keep bot count within capacity
-    const bots = this.members.filter(m => m.bot);
-    const humans = this.humans.length;
-    const want = clamp(this.settings.bots, 0, MAX_MEMBERS - humans);
     if (this.phase !== 'lobby') return;
+    const bots = this.members.filter(m => m.bot), want = clamp(this.set.bots, 0, MAX - this.humans.length);
     while (bots.length > want) { const b = bots.pop(); this.members = this.members.filter(x => x !== b); }
     while (bots.length < want) {
       const used = new Set(this.members.map(x => x.name));
-      const name = BOT_NAMES.find(n => !used.has(n)) || 'بوت' + nextId;
-      const b = { id: nextId++, name, look: { s: (Math.random() * 10) | 0, c: (Math.random() * 16) | 0, d: (Math.random() * 16) | 0, o: (Math.random() * 10) | 0, h: (Math.random() * 12) | 0, f: (Math.random() * 6) | 0 }, ready: true, team: 0, bot: true, wins: 0, skill: 0.55 + Math.random() * 0.45 };
-      this.autoTeam(b); this.members.push(b); bots.push(b);
+      const b = { id: nextId++, name: BOT_NAMES.find(n => !used.has(n)) || 'بوت' + nextId, look: randomLook(), ready: true, team: 0, bot: true, wins: 0, skill: 0.5 + Math.random() * 0.5 };
+      this.balance(b); this.members.push(b); bots.push(b);
     }
   }
 
-  // ---- settings / lobby actions (host only where relevant)
   handle(ws, msg) {
     const m = ws.member; if (!m) return;
+    const host = m.id === this.hostId, lobby = this.phase === 'lobby';
     switch (msg.t) {
-      case 'in':
-        if (this.game) this.game.setInput(m.id, msg); break;
-      case 'emote':
-        if (this.game && (msg.n | 0) >= 0 && (msg.n | 0) < 8) this.game.emote(m.id, msg.n | 0); break;
-      case 'look':
-        m.look = cleanLook(msg.look); if (msg.name !== undefined) m.name = cleanName(msg.name) || m.name; this.sync(); break;
-      case 'ready':
-        if (this.phase === 'lobby') { m.ready = !!msg.v; this.sync(); } break;
-      case 'team':
-        if (this.phase === 'lobby') { m.team = m.team ? 0 : 1; this.sync(); } break;
-      case 'chat': {
-        const text = String(msg.text || '').replace(/[<>]/g, '').slice(0, 120).trim();
-        if (text) this.broadcast({ t: 'chat', from: m.name, id: m.id, text });
-        break;
-      }
-      case 'settings':
-        if (m.id !== this.hostId || this.phase !== 'lobby') break;
-        if (msg.map === 'random' || Maps.list.some(x => x.id === msg.map)) this.settings.map = msg.map;
-        if (msg.mode === 'ffa' || msg.mode === 'teams') this.settings.mode = msg.mode;
-        if ([1, 2, 3, 5, 7].includes(msg.wins | 0)) this.settings.wins = msg.wins | 0;
-        if (msg.bots !== undefined) this.settings.bots = clamp(msg.bots | 0, 0, MAX_MEMBERS - 1);
+      case 'in': if (this.game) this.game.setInput(m.id, msg.x, msg.z, msg.b); break;
+      case 'emote': if (this.game) this.game.emote(m.id, clamp(msg.n | 0, 0, 7)); break;
+      case 'look': m.look = cleanLook(msg.look); if (msg.name !== undefined) m.name = cleanName(msg.name) || m.name; this.sync(); break;
+      case 'ready': if (lobby) { m.ready = !!msg.v; this.sync(); } break;
+      case 'team': if (lobby) { m.team = m.team ? 0 : 1; this.sync(); } break;
+      case 'chat': { const text = String(msg.text || '').replace(/[<>]/g, '').slice(0, 120).trim(); if (text) this.broadcast({ t: 'chat', from: m.name, text }); break; }
+      case 'set':
+        if (!host || !lobby) break;
+        if (msg.stage === 'random' || STAGES.some(s => s.id === msg.stage)) this.set.stage = msg.stage;
+        if (msg.mode === 'melee' || msg.mode === 'gang') this.set.mode = msg.mode;
+        if ([1, 2, 3, 5, 7].includes(msg.wins | 0)) this.set.wins = msg.wins | 0;
+        if (msg.bots !== undefined) this.set.bots = clamp(msg.bots | 0, 0, MAX - 1);
         this.fixBots(); this.sync(); break;
-      case 'start':
-        if (m.id === this.hostId && this.phase === 'lobby') this.startMatch(); break;
-      case 'tolobby':
-        if (m.id === this.hostId && this.phase !== 'lobby') this.toLobby(); break;
+      case 'start': if (host && lobby) this.startMatch(); break;
+      case 'tolobby': if (host && !lobby) this.toLobby(); break;
       case 'kick': {
-        if (m.id !== this.hostId) break;
-        const t = this.members.find(x => x.id === (msg.id | 0));
-        if (!t || t === m) break;
-        if (t.bot) { this.settings.bots = Math.max(0, this.settings.bots - 1); this.members = this.members.filter(x => x !== t); this.sync(); }
+        if (!host) break;
+        const t = this.members.find(x => x.id === (msg.id | 0)); if (!t || t === m) break;
+        if (t.bot) { this.set.bots = Math.max(0, this.set.bots - 1); this.members = this.members.filter(x => x !== t); this.sync(); }
         else { send(t.ws, { t: 'kicked' }); t.ws.close(); }
         break;
       }
@@ -160,106 +128,83 @@ class Room {
   startMatch() {
     if (this.members.length < 2) { this.broadcast({ t: 'toast', k: 'need2' }); return; }
     for (const m of this.members) m.wins = 0;
-    if (this.settings.mode === 'teams') {
-      const c = [0, 0]; this.members.forEach(m => c[m.team]++);
-      if (!c[0] || !c[1]) this.members.forEach((m, i) => { m.team = i % 2; });
-    }
-    this.round = 0;
-    this.startRound();
+    if (this.set.mode === 'gang') { const c = [0, 0]; this.members.forEach(m => c[m.team]++); if (!c[0] || !c[1]) this.members.forEach((m, i) => { m.team = i % 2; }); }
+    this.round = 0; this.startRound();
   }
-  pickMap() {
-    if (this.settings.map !== 'random') return this.settings.map;
-    const pool = Maps.list.map(m => m.id).filter(id => id !== this.lastMap);
+  pickStage() {
+    if (this.set.stage !== 'random') return this.set.stage;
+    const pool = STAGES.map(s => s.id).filter(id => id !== this.lastStage);
     return pool[(Math.random() * pool.length) | 0];
   }
   startRound() {
-    const teams = this.settings.mode === 'teams';
-    const mapId = this.pickMap(); this.lastMap = mapId;
-    const parts = this.members.map(m => ({ id: m.id, name: m.name, look: m.look, team: teams ? m.team : m.id, bot: m.bot, skill: m.skill }));
-    this.game = new Game(mapId, parts);
-    this.rid++; this.round = (this.round || 0) + 1;
-    this.phase = 'countdown'; this.timer = Math.round(3.4 / DT); this.endTimer = 0; this.roundTicks = 0;
-    this.roundMsg = { t: 'round', rid: this.rid, map: mapId, round: this.round, teams, ids: parts.map(p => p.id) };
-    this.broadcast(this.roundMsg);
-    this.sync();
+    const gang = this.set.mode === 'gang', stage = this.pickStage(); this.lastStage = stage;
+    const parts = this.members.map(m => ({ id: m.id, name: m.name, team: gang ? m.team : 100 + m.id, bot: m.bot, skill: m.skill }));
+    this.game = new Game(stage, parts, botThink);
+    this.rid = (this.rid + 1) & 0xffff; this.round++;
+    this.phase = 'countdown'; this.timer = Math.round(3.6 / DT); this.endTimer = 0; this.ticks = 0; this.winTeam = null;
+    this.roundMsg = { t: 'round', rid: this.rid, stage, round: this.round, gang, ids: parts.map(p => p.id) };
+    this.broadcast(this.roundMsg); this.sync();
   }
   toLobby() {
     this.phase = 'lobby'; this.game = null; this.roundMsg = null;
     for (const m of this.members) { m.wins = 0; if (!m.bot) m.ready = false; }
-    this.fixBots();
-    this.sync();
+    this.fixBots(); this.sync();
   }
-  teamOf(p) { return p.team; }
 
   step() {
-    if (!this.game) return;
-    const g = this.game;
+    const g = this.game; if (!g) return;
     this.steps++;
-    if (this.phase === 'countdown') {
-      g.frozen = true;
-      if (--this.timer <= 0) { this.phase = 'playing'; g.frozen = false; }
-    } else if (this.phase === 'playing') {
-      g.frozen = false; this.roundTicks++;
-    }
+    if (this.phase === 'countdown') { g.frozen = true; if (--this.timer <= 0) { this.phase = 'playing'; g.frozen = false; } }
+    else if (this.phase === 'playing') this.ticks++;
     g.step();
     if (this.phase === 'playing') {
-      const alive = g.alive();
-      const teams = new Set(alive.map(p => p.team));
-      if (!this.endTimer && g.players.length >= 2 && teams.size <= 1) this.endTimer = Math.round(1.3 / DT);
-      if (!this.endTimer && this.roundTicks > 150 / DT) this.endTimer = 1; // time out -> draw
+      const teams = new Set(g.alive().map(b => b.team));
+      if (!this.endTimer && g.beasts.length >= 2 && teams.size <= 1) { this.endTimer = Math.round(1.4 / DT); this.winTeam = teams.size === 1 ? [...teams][0] : null; }
+      if (!this.endTimer && this.ticks > 180 / DT) this.endTimer = 1;           // nobody finished it: draw
       if (this.endTimer && --this.endTimer <= 0) this.endRound();
     } else if (this.phase === 'roundEnd') {
-      if (--this.timer <= 0) {
-        const win = this.members.find(m => m.wins >= this.settings.wins);
-        if (win) this.endMatch(win); else this.startRound();
+      if (--this.timer <= 0) { const w = this.members.find(m => m.wins >= this.set.wins); if (w) this.endMatch(w); else this.startRound(); }
+    } else if (this.phase === 'matchEnd') { if (--this.timer <= 0) this.toLobby(); }
+
+    const ev = g.takeEvents();
+    if (ev.length) this.broadcast({ t: 'ev', ts: now(), l: ev });
+    if (this.steps % 2 === 0) {                                                 // snapshots at 30 Hz
+      const ph = this.phase === 'countdown' ? 0 : this.phase === 'playing' ? 1 : this.phase === 'roundEnd' ? 2 : 3;
+      const buf = g.snapshot(this.rid, ph, this.phase === 'countdown' ? Math.ceil(this.timer * DT) : 0, now());
+      for (const m of this.members) {
+        if (m.bot || m.ws.readyState !== 1) continue;
+        if (m.ws.bufferedAmount > 30000) continue;                               // slow link: skip a frame rather than queue up lag
+        m.ws.send(buf);
       }
-    } else if (this.phase === 'matchEnd') {
-      if (--this.timer <= 0) this.toLobby();
     }
-    // network: snapshot at 30Hz
-    if (this.steps % 2 === 0) this.sendSnap();
   }
   endRound() {
-    const g = this.game, alive = g.alive();
-    const teams = new Set(alive.map(p => p.team));
-    let winnerIds = [], winTeam = null;
-    if (teams.size === 1 && alive.length) {
-      winTeam = alive[0].team;
-      winnerIds = g.players.filter(p => p.team === winTeam).map(p => p.id);
-      for (const m of this.members) if (winnerIds.includes(m.id)) m.wins++;
+    const g = this.game;
+    let winners = [], team = null;
+    if (this.winTeam != null) {
+      team = this.winTeam; winners = g.beasts.filter(b => b.team === team).map(b => b.id);
+      for (const m of this.members) if (winners.includes(m.id)) m.wins++;
     }
-    this.phase = 'roundEnd'; this.timer = Math.round(3.6 / DT);
-    this.broadcast({ t: 'roundend', winners: winnerIds, teamMode: this.settings.mode === 'teams', team: winTeam, draw: !winnerIds.length });
+    this.phase = 'roundEnd'; this.timer = Math.round(4.2 / DT);
+    this.broadcast({ t: 'roundend', winners, gang: this.set.mode === 'gang', team, draw: !winners.length });
     this.sync();
   }
-  endMatch(win) {
-    this.phase = 'matchEnd'; this.timer = Math.round(8 / DT);
-    const ids = this.settings.mode === 'teams' ? this.members.filter(m => m.team === win.team).map(m => m.id) : [win.id];
-    this.broadcast({ t: 'matchend', winners: ids, teamMode: this.settings.mode === 'teams', team: win.team });
+  endMatch(w) {
+    this.phase = 'matchEnd'; this.timer = Math.round(9 / DT);
+    const gang = this.set.mode === 'gang';
+    this.broadcast({ t: 'matchend', winners: gang ? this.members.filter(m => m.team === w.team).map(m => m.id) : [w.id], gang, team: w.team });
     this.sync();
-  }
-  sendSnap() {
-    const s = this.game.snapshot();
-    s.t = 's'; s.rid = this.rid; s.ts = Math.round(process.uptime() * 1000);
-    s.ph = this.phase === 'countdown' ? 0 : this.phase === 'playing' ? 1 : this.phase === 'roundEnd' ? 2 : 3;
-    if (this.phase === 'countdown') s.cd = Math.ceil(this.timer * DT);
-    const str = JSON.stringify(s);
-    for (const m of this.members) {
-      if (m.bot || m.ws.readyState !== 1) continue;
-      if (m.ws.bufferedAmount > 40000) continue; // slow connection: drop this frame instead of lagging further
-      m.ws.send(str);
-    }
   }
 }
 
 // ---------------------------------------------------------------- sockets
 wss.on('connection', ws => {
-  ws.isAlive = true; ws.msgCount = 0; ws.winStart = Date.now();
+  ws.isAlive = true; ws.n = 0; ws.t0 = Date.now();
   ws.on('pong', () => { ws.isAlive = true; });
-  ws.on('message', raw => {
-    const now = Date.now();
-    if (now - ws.winStart > 1000) { ws.winStart = now; ws.msgCount = 0; }
-    if (++ws.msgCount > 150) return; // flood protection
+  ws.on('message', (raw, isBinary) => {
+    if (isBinary) return;
+    const t = Date.now(); if (t - ws.t0 > 1000) { ws.t0 = t; ws.n = 0; }
+    if (++ws.n > 160) return;                                                    // flood protection
     let msg; try { msg = JSON.parse(raw); } catch { return; }
     if (!msg || typeof msg.t !== 'string') return;
     if (msg.t === 'ping') return send(ws, { t: 'pong', c: msg.c });
@@ -267,19 +212,18 @@ wss.on('connection', ws => {
       if (msg.t === 'leave') { const r = ws.room; r.remove(ws.member); ws.room = null; ws.member = null; return; }
       return ws.room.handle(ws, msg);
     }
-    if (msg.t === 'create') {
-      const r = new Room(newCode(), !!msg.pub); rooms.set(r.code, r); r.add(ws, msg.name, msg.look);
-    } else if (msg.t === 'join') {
+    if (msg.t === 'create') { const r = new Room(newCode(), !!msg.pub); rooms.set(r.code, r); r.add(ws, msg.name, msg.look); }
+    else if (msg.t === 'join') {
       const r = rooms.get(String(msg.code || '').toUpperCase().trim());
       if (!r) return send(ws, { t: 'err', k: 'noroom' });
-      if (r.members.length >= MAX_MEMBERS) {
+      if (r.members.length >= MAX) {
         const bot = r.members.find(m => m.bot);
-        if (bot && r.phase === 'lobby') { r.members = r.members.filter(x => x !== bot); r.settings.bots = Math.max(0, r.settings.bots - 1); }
+        if (bot && r.phase === 'lobby') { r.members = r.members.filter(x => x !== bot); r.set.bots = Math.max(0, r.set.bots - 1); }
         else return send(ws, { t: 'err', k: 'full' });
       }
       r.add(ws, msg.name, msg.look);
     } else if (msg.t === 'quick') {
-      let r = [...rooms.values()].find(x => x.pub && x.phase === 'lobby' && x.humans.length < MAX_MEMBERS - 1 && x.members.length < MAX_MEMBERS);
+      let r = [...rooms.values()].find(x => x.pub && x.phase === 'lobby' && x.humans.length < MAX - 1 && x.members.length < MAX);
       if (!r) { r = new Room(newCode(), true); rooms.set(r.code, r); }
       r.add(ws, msg.name, msg.look);
     }
@@ -288,25 +232,21 @@ wss.on('connection', ws => {
   ws.on('error', () => { });
 });
 
-// keep-alive (also drops dead connections)
 setInterval(() => {
   for (const ws of wss.clients) { if (!ws.isAlive) { ws.terminate(); continue; } ws.isAlive = false; try { ws.ping(); } catch { } }
   for (const [code, r] of rooms) if (!r.humans.length) rooms.delete(code);
 }, 15000);
 
-// fixed 60Hz simulation loop
-let last = process.hrtime.bigint(), acc = 0;
+// fixed 60 Hz simulation
+let last = performance.now(), acc = 0;
 setInterval(() => {
-  const now = process.hrtime.bigint();
-  acc += Number(now - last) / 1e9; last = now;
-  if (acc > 0.25) acc = 0.25;
-  while (acc >= DT) { acc -= DT; for (const r of rooms.values()) r.step(); }
+  const t = performance.now(); acc += (t - last) / 1000; last = t;
+  if (acc > 0.2) acc = 0.2;
+  while (acc >= DT) { acc -= DT; for (const r of rooms.values()) { try { r.step(); } catch (e) { console.error('room', r.code, e); r.toLobby(); } } }
 }, 8);
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('\n  BLOB BRAWL server is running!\n');
-  console.log('  Local:    http://localhost:' + PORT);
-  for (const list of Object.values(os.networkInterfaces()))
-    for (const n of list) if (n.family === 'IPv4' && !n.internal) console.log('  Network:  http://' + n.address + ':' + PORT + '   <- friends on the same Wi-Fi use this');
-  console.log('\n  For friends over the internet see README.md (start-online.bat)\n');
+  console.log('\n  BLOB BRAWL server is running\n\n  Local:    http://localhost:' + PORT);
+  for (const list of Object.values(os.networkInterfaces())) for (const n of list) if (n.family === 'IPv4' && !n.internal) console.log('  Network:  http://' + n.address + ':' + PORT);
+  console.log('');
 });
